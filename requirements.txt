@@ -3,7 +3,5 @@ opencv-python-headless
 numpy<2.0.0
 pillow
 plotly
-# 添加 AI 模型库
-cellpose==3.0.10
-# 必要的图像解码库
-imagecodecs
+streamlit-drawable-canvas==0.9.3
+scikit-learn
