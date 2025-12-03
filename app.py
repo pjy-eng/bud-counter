@@ -24,21 +24,42 @@ MODEL_PATH = "ResNet18_window96_v2.pth"
 # =========================
 # 加载模型（自动下载）
 # =========================
+import requests
+
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
-        with st.spinner("📥 首次运行，正在自动下载模型权重..."):
-            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        with st.spinner("📥 首次运行，正在安全下载模型权重（Google Drive 大文件模式）..."):
+            session = requests.Session()
+            response = session.get(MODEL_URL, stream=True)
+
+            # ✅ 处理 Google Drive >40MB 的确认下载机制
+            for key, value in response.cookies.items():
+                if key.startswith("download_warning"):
+                    params = {"confirm": value}
+                    response = session.get(MODEL_URL, params=params, stream=True)
+                    break
+
+            # ✅ 真正写入二进制权重文件
+            with open(MODEL_PATH, "wb") as f:
+                for chunk in response.iter_content(32768):
+                    if chunk:
+                        f.write(chunk)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model = models.resnet18(pretrained=False)
-    model.fc = nn.Linear(model.fc.in_features, 2)  # Bud vs 非Bud
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.fc = nn.Linear(model.fc.in_features, 2)
+
+    # ✅ 现在这里加载的一定是“真权重文件”
+    state = torch.load(MODEL_PATH, map_location=device)
+    model.load_state_dict(state, strict=True)
 
     model.to(device)
     model.eval()
+
     return model, device
+
 
 model, device = load_model()
 
