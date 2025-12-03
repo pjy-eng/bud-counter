@@ -3,165 +3,119 @@ import cv2
 import numpy as np
 from PIL import Image
 import plotly.express as px
-from streamlit_drawable_canvas import st_canvas
+import time
 
-st.set_page_config(page_title="Bud Counter Toolbox", layout="wide")
+# 尝试导入 Cellpose，如果环境没装好会报错
+try:
+    from cellpose import models, utils
+    CELLPOSE_AVAILABLE = True
+except ImportError:
+    CELLPOSE_AVAILABLE = False
 
-# ==========================================
-# 算法引擎 1: 模板匹配 (您之前觉得好用的版本)
-# ==========================================
-def run_template_matching(img_gray, roi_coords, threshold):
-    # 1. 预处理
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    img_enhanced = clahe.apply(img_gray)
-    
-    # 2. 提取模板
-    rx, ry, rw, rh = roi_coords['left'], roi_coords['top'], roi_coords['width'], roi_coords['height']
-    if rw <= 0 or rh <= 0: return [], img_enhanced, "模板无效"
-    
-    template = img_enhanced[ry:ry+rh, rx:rx+rw]
-    
-    # 3. 匹配
-    res = cv2.matchTemplate(img_enhanced, template, cv2.TM_CCOEFF_NORMED)
-    loc = np.where(res >= threshold)
-    
-    # 4. 转换结果
-    boxes = []
-    for pt in zip(*loc[::-1]):
-        boxes.append([int(pt[0]), int(pt[1]), rw, rh])
-    
-    # 5. 去重
-    rects, _ = cv2.groupRectangles(boxes, groupThreshold=1, eps=0.3)
-    
-    # 6. 绘图
-    res_img = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-    final_buds = []
-    user_center = (rx + rw//2, ry + rh//2)
-    
-    for (x, y, w, h) in rects:
-        # 排除用户自己画的那个
-        curr_center = (x + w//2, y + h//2)
-        dist = np.sqrt((user_center[0]-curr_center[0])**2 + (user_center[1]-curr_center[1])**2)
-        if dist < rw / 2: continue
-            
-        final_buds.append([x, y, w, h])
-        cv2.rectangle(res_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
-        
-    cv2.rectangle(res_img, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
-    return final_buds, res_img, None
+st.set_page_config(page_title="AI Bud Counter (Cellpose)", layout="wide")
 
 # ==========================================
-# 算法引擎 2: 霍夫圆变换 (新方法)
+# AI 核心逻辑
 # ==========================================
-def run_hough_circles(img_gray, params):
-    # 1. 预处理 (霍夫变换对噪点极其敏感，需要强力模糊)
-    # 中值模糊去除椒盐噪点
-    blurred = cv2.medianBlur(img_gray, 5)
+@st.cache_resource
+def load_cellpose_model():
+    """
+    加载模型只做一次，并缓存起来，防止每次点击都重新加载
+    """
+    # model_type='cyto' 是通用的细胞模型
+    # gpu=False 表示强制使用 CPU (Streamlit Cloud 没有 GPU)
+    print("⏳ 正在下载/加载 Cellpose 模型...")
+    model = models.Cellpose(model_type='cyto', gpu=False)
+    return model
+
+def run_ai_prediction(img_rgb, diameter, flow_threshold, cellprob_threshold):
+    # 加载模型
+    model = load_cellpose_model()
     
-    # 2. 霍夫圆检测
-    circles = cv2.HoughCircles(
-        blurred, 
-        cv2.HOUGH_GRADIENT, 
-        dp=1,                   # 分辨率倒数
-        minDist=params['min_dist'], # 圆心之间的最小距离
-        param1=params['canny_th'],  # Canny 边缘检测的高阈值
-        param2=params['accum_th'],  # 圆心累加器阈值 (越小越容易检测到圆，也容易误检)
-        minRadius=params['min_r'], 
-        maxRadius=params['max_r']
+    # 开始预测
+    # channels=[0,0] 表示灰度图或自动推断
+    # diameter: 细胞大概的直径
+    masks, flows, styles, diams = model.eval(
+        img_rgb, 
+        diameter=diameter,
+        channels=[0,0],
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold
     )
     
-    res_img = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-    buds = []
-    
-    if circles is not None:
-        circles = np.uint16(np.around(circles))
-        for i in circles[0, :]:
-            # i = [x, y, r]
-            buds.append(i)
-            # 画圆
-            cv2.circle(res_img, (i[0], i[1]), i[2], (0, 255, 0), 2)
-            # 画圆心
-            cv2.circle(res_img, (i[0], i[1]), 2, (0, 0, 255), 3)
-            
-    return buds, res_img
+    return masks
 
 # ==========================================
-# 主界面逻辑
+# UI 布局
 # ==========================================
-st.title("🔬 细胞计数工具箱 (双引擎版)")
+st.title("🤖 AI 细胞计数 (Cellpose 云端版)")
 
-# 侧边栏：选择算法
-algorithm = st.sidebar.selectbox("🛠️ 选择核心算法", ["A. 模板匹配 (纹理)", "B. 霍夫圆检测 (几何形状)"])
+if not CELLPOSE_AVAILABLE:
+    st.error("❌ 未检测到 Cellpose 库。请检查 requirements.txt 是否包含了 'cellpose'。")
+    st.stop()
 
+st.info("💡 提示：这是一个深度学习模型。在云端 CPU 上运行可能需要 10~30 秒，请耐心等待。")
+
+# --- 侧边栏：AI 参数 ---
+st.sidebar.header("🧠 AI 参数设置")
+
+# 直径 (Diameter) 是最重要的参数
+diameter = st.sidebar.number_input(
+    "预估 Bud 直径 (像素)", 
+    min_value=10, max_value=200, value=60, step=5,
+    help="大概估算一下你的 Bud 有多大。如果设为 0，AI 会尝试自动估算（更慢）。"
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 进阶微调")
+flow_th = st.sidebar.slider("形态一致性 (Flow Thresh)", 0.0, 1.0, 0.4, 0.1, help="值越小，要求形状越规则；值越大，允许更多异形。")
+cellprob_th = st.sidebar.slider("置信度 (Cell Prob)", -6.0, 6.0, 0.0, 0.5, help="值越低，找到的越多（可能误检）；值越高，越严格。")
+
+# --- 主界面 ---
 uploaded_file = st.file_uploader("上传图像", type=["jpg", "png", "tif"])
 
 if uploaded_file:
     pil_img = Image.open(uploaded_file).convert("RGB")
     img_array = np.array(pil_img)
-    img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    
-    col1, col2 = st.columns([2, 1])
 
-    # ================= 模式 A: 模板匹配 =================
-    if algorithm == "A. 模板匹配 (纹理)":
-        st.sidebar.divider()
-        st.sidebar.markdown("### A 模式参数")
-        tm_thresh = st.sidebar.slider("相似度阈值", 0.3, 0.95, 0.60, 0.01)
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("1. 原始图像")
+        st.image(pil_img, use_column_width=True)
+
+    with col2:
+        st.subheader("2. AI 分析结果")
         
-        with col1:
-            st.subheader("1. 框选模板")
-            canvas = st_canvas(
-                fill_color="rgba(0, 255, 0, 0.2)",
-                stroke_color="#00FF00",
-                background_image=pil_img,
-                update_streamlit=True,
-                height=500,
-                drawing_mode="rect",
-                key="canvas_a"
-            )
-            
-        with col2:
-            st.subheader("2. 分析结果")
-            if canvas.json_data and len(canvas.json_data["objects"]) > 0:
-                obj = canvas.json_data["objects"][-1]
-                roi = {'left':int(obj['left']), 'top':int(obj['top']), 'width':int(obj['width']), 'height':int(obj['height'])}
+        # 添加一个大按钮来触发计算，避免自动运行太卡
+        if st.button("🚀 运行 AI 分析", type="primary"):
+            with st.spinner("AI 正在思考中... (可能需要几十秒)"):
+                start_time = time.time()
                 
-                if roi['width'] > 0:
-                    buds, res_img, _ = run_template_matching(img_gray, roi, tm_thresh)
-                    st.metric("计数 (含模板)", f"{len(buds)+1} 个")
-                    st.image(res_img, use_column_width=True)
-            else:
-                st.info("请在左侧画框。")
+                # 运行预测
+                masks = run_ai_prediction(img_array, diameter, flow_th, cellprob_th)
+                
+                # 处理结果
+                num_cells = masks.max()
+                end_time = time.time()
+                
+                # 绘制轮廓
+                # 获取轮廓线条
+                outlines = utils.outlines_list(masks)
+                
+                res_img = img_array.copy()
+                for o in outlines:
+                    # o 是 [y, x] 坐标
+                    pts = o.reshape((-1, 1, 2)).astype(np.int32)
+                    # 注意 cellpose 返回的是 y,x，opencv 需要 x,y，需要翻转一下
+                    # utils.outlines_list 返回的通常已经是像素坐标，但顺序可能需要调整
+                    # 这里直接用 matplotlib 的思路画图可能不方便，我们用 cv2 画
+                    # 需要把 [y, x] 转为 [x, y]
+                    pts_xy = np.flip(pts, axis=2) 
+                    cv2.polylines(res_img, [pts_xy], isClosed=True, color=(255, 0, 0), thickness=2)
 
-    # ================= 模式 B: 霍夫圆检测 =================
-    else:
-        st.sidebar.divider()
-        st.sidebar.markdown("### B 模式参数 (霍夫圆)")
-        # 霍夫变换的参数比较多，这里提供最关键的调节
-        h_min_dist = st.sidebar.slider("圆心最小间距 (minDist)", 10, 100, 30, help="如果结果重叠严重，调大此值")
-        h_accum_th = st.sidebar.slider("检测灵敏度 (Accumulator)", 10, 100, 30, help="越小越灵敏(圆越多)，越大越严格")
-        h_min_r = st.sidebar.slider("最小半径", 5, 50, 15)
-        h_max_r = st.sidebar.slider("最大半径", 20, 100, 50)
-        
-        with col1:
-            st.subheader("1. 原始图像")
-            st.image(pil_img, use_column_width=True)
-            st.caption("霍夫变换不需要画框，它会自动全图找圆。")
-            
-        with col2:
-            st.subheader("2. 自动检圆结果")
-            # 实时计算
-            params = {
-                'min_dist': h_min_dist, 'canny_th': 100, 
-                'accum_th': h_accum_th, 'min_r': h_min_r, 'max_r': h_max_r
-            }
-            buds, res_img = run_hough_circles(img_gray, params)
-            
-            st.metric("检测到的圆", f"{len(buds)} 个")
-            st.image(res_img, use_column_width=True)
-            
-            if len(buds) == 0:
-                st.warning("未检测到圆。请尝试降低'检测灵敏度'数值，或调整半径范围。")
-
+                st.success(f"✅ 识别完成！找到 {num_cells} 个目标 (耗时 {end_time-start_time:.1f}s)")
+                st.image(res_img, caption=f"Count: {num_cells}", use_column_width=True)
+                
 else:
-    st.info("请先上传图片。")
+    st.info("请上传图片后点击运行。")
