@@ -1,79 +1,89 @@
+import google.generativeai as genai
 import cv2
 import numpy as np
 from PIL import Image
+import json
+import re
 
-def find_similar_buds(pil_image, user_boxes, threshold=0.7):
+def parse_json_from_markdown(text):
+    """从 Markdown 代码块中提取 JSON"""
+    try:
+        # 尝试通过正则寻找 ```json ... ```
+        match = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+        # 如果没有代码块，尝试直接解析
+        return json.loads(text)
+    except Exception as e:
+        print(f"JSON 解析失败: {e}")
+        return []
+
+def detect_with_gemini(api_key, pil_image):
     """
-    根据用户圈选的样本框，在整张图中寻找相似的区域。
-
-    Args:
-        pil_image: 用户上传的原始 PIL 图片。
-        user_boxes: 一个列表，包含用户画的框的字典 [{'left': x, 'top': y, 'width': w, 'height': h}, ...]。
-        threshold: 匹配相似度阈值 (0-1)，越高越严格。
-
-    Returns:
-        processed_image: 绘制了所有检测结果的 OpenCV 图像。
-        count: 检测到的总数（包括用户圈选的）。
+    调用 Gemini 1.5 Flash 识别细胞出芽，并返回绘制好框的图片。
     """
-    # 1. 图像预处理
-    # 转换为 OpenCV 格式 (BGR) 用于处理
-    cv_image = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
-    processed_image = cv_image.copy()
-    # 转换为灰度图用于模板匹配
-    gray_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-
-    detected_boxes = []
-
-    # 2. 遍历用户圈选的每一个样本框
-    for box in user_boxes:
-        # 提取边界框坐标 (确保在图片范围内)
-        x = max(0, int(box['left']))
-        y = max(0, int(box['top']))
-        w = int(box['width'])
-        h = int(box['height'])
-        
-        # 忽略无效的框
-        if w <= 0 or h <= 0: continue
-
-        # 从灰度图中裁剪出模板区域
-        template = gray_image[y:y+h, x:x+w]
-        template_h, template_w = template.shape[:2]
-        
-        # 3. 执行模板匹配
-        # 使用标准相关系数匹配法 (TM_CCOEFF_NORMED)，结果在 0-1 之间
-        try:
-            res = cv2.matchTemplate(gray_image, template, cv2.TM_CCOEFF_NORMED)
-        except Exception as e:
-            print(f"模板太小或在边界外，跳过: {e}")
-            continue
-
-        # 4. 筛选高匹配度区域
-        # 找到大于设定阈值的所有位置
-        loc = np.where(res >= threshold)
-        
-        # 将匹配点转换为边界框格式 [x, y, w, h]
-        for pt in zip(*loc[::-1]): # loc 是 (y, x)，需要反转为 (x, y)
-            detected_boxes.append([int(pt[0]), int(pt[1]), template_w, template_h])
-
-    # 5. 去除重叠框 (非极大值抑制 - NMS)
-    # 这是一个关键步骤，防止对同一个目标画出多个框
-    if not detected_boxes:
-        return cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB), 0
-
-    detected_boxes = np.array(detected_boxes)
-    boxes_for_nms = detected_boxes[:, :4].tolist() # 只取 x, y, w, h
-    scores = np.ones(len(boxes_for_nms)).tolist() # 这里暂时假设所有框的得分一样
+    # 1. 配置 API
+    genai.configure(api_key=api_key)
     
-    # NMS 阈值，重叠度大于 0.3 的框会被合并
-    indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores, score_threshold=threshold, nms_threshold=0.3)
+    # 使用 Flash 模型，速度快且便宜（对于视觉任务通常足够）
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # 2. 构造 Prompt (提示词)
+    # 关键在于要求它返回 normalized bounding boxes (0-1000)
+    prompt = """
+    Look at this microscope image of yeast cells. 
+    Identify the "buds" (daughter cells growing off the larger mother cells).
+    Ignore the large mother cells, only find the buds.
+    
+    Return a JSON object with a key "boxes". 
+    The value should be a list of bounding boxes for each bud found.
+    Each bounding box must be in the format [ymin, xmin, ymax, xmax], 
+    where the coordinates are normalized to a scale of 0 to 1000 (0 is top/left, 1000 is bottom/right).
+    
+    Example output format:
+    ```json
+    {
+      "boxes": [
+         [100, 200, 150, 250],
+         [500, 600, 550, 650]
+      ]
+    }
+    ```
+    """
 
-    final_count = 0
-    if len(indices) > 0:
-        for i in indices.flatten():
-            (x, y, w, h) = boxes_for_nms[i]
-            # 在结果图上画矩形框 (红色，线宽 2)
-            cv2.rectangle(processed_image, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            final_count += 1
+    try:
+        # 3. 发送请求
+        response = model.generate_content([prompt, pil_image])
+        result_text = response.text
+        print("Gemini Raw Response:", result_text) # 调试用
 
-    # 将最终结果转换回 RGB 格式供 Streamlit 显示
-    return cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB), final_count
+        # 4. 解析坐标
+        data = parse_json_from_markdown(result_text)
+        boxes = data.get("boxes", [])
+        
+        # 5. 在原图上绘图
+        # 转换图片格式 PIL -> OpenCV
+        cv_image = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
+        h_img, w_img, _ = cv_image.shape
+        
+        count = 0
+        for box in boxes:
+            # Gemini 返回的是 [ymin, xmin, ymax, xmax] (0-1000 scale)
+            ymin, xmin, ymax, xmax = box
+            
+            # 转换为实际像素坐标
+            left = int((xmin / 1000) * w_img)
+            top = int((ymin / 1000) * h_img)
+            right = int((xmax / 1000) * w_img)
+            bottom = int((ymax / 1000) * h_img)
+            
+            # 画框 (绿色, 线宽 2)
+            cv2.rectangle(cv_image, (left, top), (right, bottom), (0, 255, 0), 2)
+            # 标号
+            cv2.putText(cv_image, f"Bud {count+1}", (left, top-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            count += 1
+            
+        return cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB), count, None
+
+    except Exception as e:
+        return np.array(pil_image), 0, str(e)
