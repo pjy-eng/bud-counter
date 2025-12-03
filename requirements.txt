@@ -3,3 +3,4 @@ opencv-python-headless
 numpy
 plotly
 pillow
+streamlit-drawable-canvas
