@@ -17,7 +17,8 @@ st.title("🔬 Bud 自动识别系统（ResNet18 · 96×96 · 云端版）")
 # =========================
 # 模型下载配置（★你只需要改这里的 URL）
 # =========================
-MODEL_URL = "https://你的直链/ResNet18_window96_v2.pth"   # ← 替换成你的真实直链
+MODEL_URL = "https://drive.google.com/uc?export=download&id=1zavGWUgpoi5j3dSwNt4Xb-VQeD9WciAA"
+"   # ← 替换成你的真实直链
 MODEL_PATH = "model.pth"
 
 # =========================
