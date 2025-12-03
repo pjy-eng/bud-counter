@@ -1,6 +1,5 @@
-streamlit==1.39.0
-streamlit-drawable-canvas==0.9.3
-opencv-python-headless
-numpy<2.0.0
+streamlit
+openai
+opencv-python
 pillow
-plotly
+numpy
