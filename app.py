@@ -3,119 +3,205 @@ import cv2
 import numpy as np
 from PIL import Image
 import plotly.express as px
-import time
+from streamlit_drawable_canvas import st_canvas
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
 
-# 尝试导入 Cellpose，如果环境没装好会报错
-try:
-    from cellpose import models, utils
-    CELLPOSE_AVAILABLE = True
-except ImportError:
-    CELLPOSE_AVAILABLE = False
+st.set_page_config(page_title="Few-Shot Bud Counter", layout="wide")
 
-st.set_page_config(page_title="AI Bud Counter (Cellpose)", layout="wide")
+if 'positive_points' not in st.session_state:
+    st.session_state['positive_points'] = []
 
 # ==========================================
-# AI 核心逻辑
+# 核心算法：基于多点特征的 One-Class SVM 学习
 # ==========================================
-@st.cache_resource
-def load_cellpose_model():
+def extract_features_around_point(img_gray, x, y, window_size=20):
     """
-    加载模型只做一次，并缓存起来，防止每次点击都重新加载
+    在点击点周围提取特征：
+    1. 局部平均灰度
+    2. 局部方差 (纹理复杂度)
+    3. 局部梯度 (边缘强度)
     """
-    # model_type='cyto' 是通用的细胞模型
-    # gpu=False 表示强制使用 CPU (Streamlit Cloud 没有 GPU)
-    print("⏳ 正在下载/加载 Cellpose 模型...")
-    model = models.Cellpose(model_type='cyto', gpu=False)
-    return model
+    h, w = img_gray.shape
+    x, y = int(x), int(y)
+    
+    # 边界保护
+    y1 = max(0, y - window_size)
+    y2 = min(h, y + window_size)
+    x1 = max(0, x - window_size)
+    x2 = min(w, x + window_size)
+    
+    patch = img_gray[y1:y2, x1:x2]
+    
+    if patch.size == 0: return np.zeros(3)
+    
+    mean_val = np.mean(patch)
+    std_val = np.std(patch)
+    
+    # 简单梯度
+    sobelx = cv2.Sobel(patch, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(patch, cv2.CV_64F, 0, 1, ksize=3)
+    grad_mag = np.mean(np.sqrt(sobelx**2 + sobely**2))
+    
+    return np.array([mean_val, std_val, grad_mag])
 
-def run_ai_prediction(img_rgb, diameter, flow_threshold, cellprob_threshold):
-    # 加载模型
-    model = load_cellpose_model()
+def train_and_predict(img_gray, points, params):
+    # 1. 准备训练数据
+    features = []
+    for p in points:
+        feat = extract_features_around_point(img_gray, p[0], p[1], params['window_size'])
+        features.append(feat)
     
-    # 开始预测
-    # channels=[0,0] 表示灰度图或自动推断
-    # diameter: 细胞大概的直径
-    masks, flows, styles, diams = model.eval(
-        img_rgb, 
-        diameter=diameter,
-        channels=[0,0],
-        flow_threshold=flow_threshold,
-        cellprob_threshold=cellprob_threshold
-    )
+    X_train = np.array(features)
     
-    return masks
+    # 标准化特征
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    
+    # 2. 训练 One-Class SVM (只学习"什么是Bud")
+    # nu 参数控制异常值的比例，gamma 控制核函数的范围
+    clf = OneClassSVM(kernel='rbf', nu=params['nu'], gamma=params['gamma'])
+    clf.fit(X_train_scaled)
+    
+    # 3. 全图滑动窗口预测 (为了速度，步长设大一点)
+    step = params['step']
+    win = params['window_size']
+    h, w = img_gray.shape
+    
+    found_points = []
+    
+    # 这里的循环如果用 Python 写会很慢，但为了演示逻辑先这样
+    # 实际部署时，这里只会在关键点附近采样，或者使用图像处理方法加速
+    # 改进策略：先用简单的阈值筛选出候选点，再用 SVM 确认
+    
+    # 快速预筛选：基于训练样本的平均亮度
+    mean_intensity = np.mean(X_train[:, 0])
+    lower_bound = mean_intensity - 30
+    upper_bound = mean_intensity + 30
+    
+    # 二值化找到大概区域
+    _, mask = cv2.threshold(img_gray, lower_bound, 255, cv2.THRESH_BINARY)
+    # 结合方差（纹理）筛选
+    # 这里简化为：只在 mask 为白色的区域采样
+    
+    y_indices, x_indices = np.where(mask > 0)
+    
+    # 随机采样或者间隔采样以提高速度
+    # 我们改用简单的滑动窗口策略，但只在可能有东西的地方滑
+    
+    # 为了演示实时性，我们退回到更简单的 "多模板匹配逻辑"
+    # SVM 在纯 Python 循环里太慢了。
+    # 方案 B：多点平均模板匹配
+    
+    return adaptive_multi_template_matching(img_gray, points, params)
+
+
+def adaptive_multi_template_matching(img_gray, points, params):
+    """
+    替代 SVM 的快速方案：
+    在每个点击位置截取一个小模板，算出平均模板，然后全图搜。
+    """
+    win = params['window_size']
+    h, w = img_gray.shape
+    templates = []
+    
+    # 1. 收集所有点击处的模板
+    for p in points:
+        x, y = int(p[0]), int(p[1])
+        y1, y2 = max(0, y-win), min(h, y+win)
+        x1, x2 = max(0, x-win), min(w, x+win)
+        patch = img_gray[y1:y2, x1:x2]
+        if patch.shape == (2*win, 2*win): # 确保尺寸一致
+            templates.append(patch)
+            
+    if not templates: return [], img_gray
+    
+    # 2. 计算平均模板 (这是关键！融合了多个样本的特征)
+    avg_template = np.mean(templates, axis=0).astype(np.uint8)
+    
+    # 3. 匹配
+    res = cv2.matchTemplate(img_gray, avg_template, cv2.TM_CCOEFF_NORMED)
+    
+    # 4. 筛选结果
+    loc = np.where(res >= params['threshold'])
+    boxes = []
+    w_t, h_t = avg_template.shape[::-1]
+    
+    for pt in zip(*loc[::-1]):
+        boxes.append([int(pt[0]), int(pt[1]), w_t, h_t])
+        
+    rects, _ = cv2.groupRectangles(boxes, groupThreshold=1, eps=0.3)
+    
+    res_img = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+    final_buds = []
+    
+    for (x, y, w_box, h_box) in rects:
+        # 绘制
+        cv2.rectangle(res_img, (x, y), (x + w_box, y + h_box), (0, 0, 255), 2)
+        final_buds.append([x, y])
+        
+    # 标记用户点击的点
+    for p in points:
+        cv2.circle(res_img, (int(p[0]), int(p[1])), 3, (0, 255, 0), -1)
+        
+    return final_buds, res_img
+
 
 # ==========================================
 # UI 布局
 # ==========================================
-st.title("🤖 AI 细胞计数 (Cellpose 云端版)")
+st.sidebar.header("🎛️ 参数设置")
+win_size = st.sidebar.slider("样本半径 (Window Size)", 10, 50, 20, help="点击点周围多大范围内算作一个样本")
+thresh = st.sidebar.slider("相似度阈值", 0.3, 0.95, 0.60)
 
-if not CELLPOSE_AVAILABLE:
-    st.error("❌ 未检测到 Cellpose 库。请检查 requirements.txt 是否包含了 'cellpose'。")
-    st.stop()
+st.title("👆 点选学习版 (Point & Find)")
+st.markdown("思路：**不要画框，直接点击** 3-5 个典型的 Bud，系统会计算它们的**平均特征**去找剩下的。")
 
-st.info("💡 提示：这是一个深度学习模型。在云端 CPU 上运行可能需要 10~30 秒，请耐心等待。")
-
-# --- 侧边栏：AI 参数 ---
-st.sidebar.header("🧠 AI 参数设置")
-
-# 直径 (Diameter) 是最重要的参数
-diameter = st.sidebar.number_input(
-    "预估 Bud 直径 (像素)", 
-    min_value=10, max_value=200, value=60, step=5,
-    help="大概估算一下你的 Bud 有多大。如果设为 0，AI 会尝试自动估算（更慢）。"
-)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 进阶微调")
-flow_th = st.sidebar.slider("形态一致性 (Flow Thresh)", 0.0, 1.0, 0.4, 0.1, help="值越小，要求形状越规则；值越大，允许更多异形。")
-cellprob_th = st.sidebar.slider("置信度 (Cell Prob)", -6.0, 6.0, 0.0, 0.5, help="值越低，找到的越多（可能误检）；值越高，越严格。")
-
-# --- 主界面 ---
 uploaded_file = st.file_uploader("上传图像", type=["jpg", "png", "tif"])
 
 if uploaded_file:
     pil_img = Image.open(uploaded_file).convert("RGB")
     img_array = np.array(pil_img)
+    img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns([2, 1])
 
     with col1:
-        st.subheader("1. 原始图像")
-        st.image(pil_img, use_column_width=True)
+        st.subheader("1. 点击样本 (Point)")
+        st.caption("请用鼠标左键点击图中的 Bud 中心。点 3 个以上效果最好。")
+        
+        # Point 模式
+        canvas = st_canvas(
+            fill_color="rgba(0, 255, 0, 1)",
+            stroke_color="#00FF00",
+            background_image=pil_img,
+            update_streamlit=True,
+            height=500,
+            drawing_mode="point", # 关键：点选模式
+            point_display_radius=5,
+            key="canvas_point"
+        )
 
     with col2:
-        st.subheader("2. AI 分析结果")
+        st.subheader("2. 学习与搜索")
         
-        # 添加一个大按钮来触发计算，避免自动运行太卡
-        if st.button("🚀 运行 AI 分析", type="primary"):
-            with st.spinner("AI 正在思考中... (可能需要几十秒)"):
-                start_time = time.time()
+        # 获取点击点
+        if canvas.json_data and len(canvas.json_data["objects"]) > 0:
+            points = []
+            for obj in canvas.json_data["objects"]:
+                points.append([obj['left'], obj['top']])
+            
+            st.info(f"已采集 {len(points)} 个样本点")
+            
+            if len(points) >= 1:
+                params = {'window_size': win_size, 'threshold': thresh}
                 
-                # 运行预测
-                masks = run_ai_prediction(img_array, diameter, flow_th, cellprob_th)
+                # 运行多点匹配
+                buds, res_img = adaptive_multi_template_matching(img_gray, points, params)
                 
-                # 处理结果
-                num_cells = masks.max()
-                end_time = time.time()
-                
-                # 绘制轮廓
-                # 获取轮廓线条
-                outlines = utils.outlines_list(masks)
-                
-                res_img = img_array.copy()
-                for o in outlines:
-                    # o 是 [y, x] 坐标
-                    pts = o.reshape((-1, 1, 2)).astype(np.int32)
-                    # 注意 cellpose 返回的是 y,x，opencv 需要 x,y，需要翻转一下
-                    # utils.outlines_list 返回的通常已经是像素坐标，但顺序可能需要调整
-                    # 这里直接用 matplotlib 的思路画图可能不方便，我们用 cv2 画
-                    # 需要把 [y, x] 转为 [x, y]
-                    pts_xy = np.flip(pts, axis=2) 
-                    cv2.polylines(res_img, [pts_xy], isClosed=True, color=(255, 0, 0), thickness=2)
-
-                st.success(f"✅ 识别完成！找到 {num_cells} 个目标 (耗时 {end_time-start_time:.1f}s)")
-                st.image(res_img, caption=f"Count: {num_cells}", use_column_width=True)
-                
-else:
-    st.info("请上传图片后点击运行。")
+                st.metric("✅ 找到相似目标", f"{len(buds)} 个")
+                st.image(res_img, use_column_width=True, caption="绿点=你的样本，红框=AI找到的")
+            else:
+                st.warning("请至少点击 1 个点。")
+        else:
+            st.info("👈 请在左图点击 Bud 中心。")
