@@ -1,15 +1,9 @@
-# 锁定 Streamlit 版本，彻底根治 AttributeError
 streamlit==1.39.0
-
-# 配合上述版本的 Canvas
-streamlit-drawable-canvas==0.9.3
-
-# Python 3.10 下的稳定版 OpenCV
 opencv-python-headless
-
-# 防止 OpenCV 报错的关键
 numpy<2.0.0
-
-# 其他基础库
 pillow
 plotly
+# 添加 AI 模型库
+cellpose==3.0.10
+# 必要的图像解码库
+imagecodecs
