@@ -8,13 +8,13 @@ from streamlit_drawable_canvas import st_canvas
 # ==========================================
 # 0. 全局配置
 # ==========================================
-st.set_page_config(page_title="Immersive Bud Counter", layout="wide")
+st.set_page_config(page_title="Bud Counter Final", layout="wide")
 
 # ==========================================
 # 1. 核心算法：经典模板匹配 (复刻 Image 2)
 # ==========================================
 def run_template_matching(img_gray, roi_coords, threshold):
-    # 1. 预处理 (CLAHE 增强)
+    # 1. 预处理 (CLAHE 增强) - 关键步骤
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img_enhanced = clahe.apply(img_gray)
     
@@ -22,15 +22,16 @@ def run_template_matching(img_gray, roi_coords, threshold):
     rx, ry, rw, rh = roi_coords['left'], roi_coords['top'], roi_coords['width'], roi_coords['height']
     
     h, w = img_enhanced.shape
+    # 边界保护
     if rw <= 5 or rh <= 5 or rx < 0 or ry < 0:
-        return [], img_enhanced, "框选太小，请重画。"
+        return [], img_enhanced, "框选太小或无效"
 
     template = img_enhanced[ry:ry+rh, rx:rx+rw]
     
-    # 3. 核心匹配 (TM_CCOEFF_NORMED)
+    # 3. 核心匹配
     res = cv2.matchTemplate(img_enhanced, template, cv2.TM_CCOEFF_NORMED)
     
-    # 4. 筛选与去重
+    # 4. 筛选
     loc = np.where(res >= threshold)
     boxes = []
     for pt in zip(*loc[::-1]):
@@ -54,7 +55,6 @@ def run_template_matching(img_gray, roi_coords, threshold):
             continue
             
         final_buds.append([x, y])
-        # 画红框
         cv2.rectangle(res_img, (x, y), (x + w_box, y + h_box), (0, 0, 255), 2)
         
     # 画绿框
@@ -63,10 +63,12 @@ def run_template_matching(img_gray, roi_coords, threshold):
     return final_buds, res_img, ""
 
 # ==========================================
-# 2. UI 布局 (完美修复版)
+# 2. UI 布局
 # ==========================================
-st.title("🔬 沉浸式 Bud 计数器")
-st.caption("现在，图片就是画布。请直接在左图上 **画框**。")
+st.title("🔬 沉浸式 Bud 计数器 (最终版)")
+st.markdown("### 操作指南：")
+st.markdown("1. 等待图片在下方加载出来。")
+st.markdown("2. 直接在**图片上**用鼠标画一个绿框（包围一个标准的 Bud）。")
 
 # 侧边栏
 st.sidebar.header("🎛️ 参数")
@@ -75,43 +77,43 @@ threshold = st.sidebar.slider("相似度阈值", 0.3, 0.95, 0.60, help="如果�
 uploaded_file = st.file_uploader("上传图像", type=["jpg", "png", "tif"])
 
 if uploaded_file:
-    # 1. 加载并计算尺寸
+    # 1. 加载图片
     pil_img = Image.open(uploaded_file).convert("RGB")
     orig_w, orig_h = pil_img.size
     
-    # === 关键修改：计算适应屏幕的显示尺寸 ===
-    # 我们将宽度固定为 700px (这是一个在网页上看起来比较舒服的宽度)
-    # 然后按比例计算高度
+    # 2. 计算显示尺寸 (宽度固定 700px)
     display_width = 700
     ratio = display_width / orig_w
     display_height = int(orig_h * ratio)
     
-    # 缩放图片，用于显示在 Canvas 上
-    # 注意：后续的算法处理也必须基于这张缩放后的图，否则坐标会对不上
+    # 3. 缩放图片 (这是关键，用于 Canvas 背景)
+    # 使用 LANCZOS 算法保证缩放清晰
     pil_img_resized = pil_img.resize((display_width, display_height), Image.Resampling.LANCZOS)
+    
+    # 准备算法用的数据 (必须也是缩放后的，保证坐标对齐)
     img_array = np.array(pil_img_resized)
     img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
     col1, col2 = st.columns([1.5, 1])
 
     with col1:
-        st.subheader("1. 框选模板")
-        st.caption("请画框包围一个标准的 Bud。")
+        st.subheader("1. 在图上画框")
         
-        # === 关键修改：画布尺寸与图片显示尺寸完全一致 ===
+        # 4. Canvas 组件
+        # 关键点：width 和 height 必须和 background_image 的尺寸完全一致
         canvas = st_canvas(
             fill_color="rgba(0, 255, 0, 0.2)",
             stroke_color="#00FF00",
-            background_image=pil_img_resized, # 背景图铺满
+            background_image=pil_img_resized, # 这里传入 PIL 图片对象
             update_streamlit=True,
-            width=display_width,   # 强制宽度无缝贴合
-            height=display_height, # 强制高度无缝贴合
-            drawing_mode="rect",   # 回归画框模式
-            key="canvas_final"
+            width=display_width,
+            height=display_height,
+            drawing_mode="rect", # 画矩形模式
+            key="canvas_final_fix"
         )
 
     with col2:
-        st.subheader("2. 结果")
+        st.subheader("2. 实时结果")
         
         # 获取画框数据
         if canvas.json_data and len(canvas.json_data["objects"]) > 0:
@@ -125,10 +127,10 @@ if uploaded_file:
             
             # 只有当框有效时才计算
             if roi['width'] > 5 and roi['height'] > 5:
-                with st.spinner("分析中..."):
+                with st.spinner("正在全图搜索..."):
                     buds, res_img, msg = run_template_matching(img_gray, roi, threshold)
                 
-                # 计数逻辑：找到的 + 模板自己
+                # 计数
                 total = len(buds) + 1
                 st.metric("✅ 总计数", f"{total} 个")
                 
@@ -137,7 +139,7 @@ if uploaded_file:
             else:
                 st.warning("框太小了，请重画。")
         else:
-            st.info("👈 请在左图直接画框。")
+            st.info("👈 请在左侧图片上直接画框。")
 
 else:
     st.info("请上传图片。")
