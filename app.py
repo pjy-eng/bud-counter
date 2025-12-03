@@ -168,19 +168,20 @@ w, h = pil_image.size
 st.subheader("① 原始图像 & ROI 框选")
 st.write("在下方画布上选择 `矩形` 工具，框选一个芽作为模板。")
 
-# 使用 drawable canvas 作为交互
+st.image(pil_image, caption="原始图像", use_column_width=False)
+
 canvas_result = st_canvas(
-    fill_color="rgba(0, 255, 0, 0.2)",  # 填充色
+    fill_color="rgba(0, 255, 0, 0.2)",
     stroke_width=2,
     stroke_color="#00FF00",
-    background_color="#000000",
-    background_image=pil_image,
+    background_color="rgba(0, 0, 0, 0)",  # 透明背景
     update_streamlit=True,
     height=h,
     width=w,
     drawing_mode="rect",
     key="canvas",
 )
+
 
 roi = None
 if canvas_result.json_data is not None:
