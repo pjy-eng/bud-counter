@@ -8,136 +8,106 @@ from streamlit_drawable_canvas import st_canvas
 # ==========================================
 # 0. 全局配置
 # ==========================================
-st.set_page_config(page_title="Bud Counter Pro", layout="wide")
+st.set_page_config(page_title="Bud Counter (Template Match)", layout="wide")
 
-# 初始化 session state
 if 'roi_coords' not in st.session_state:
     st.session_state['roi_coords'] = None
 
 # ==========================================
-# 1. 核心算法库 (保持不变)
+# 1. 核心算法：模板匹配 (复现第二张图的逻辑)
 # ==========================================
-def get_contour_features(contour):
-    area = cv2.contourArea(contour)
-    perimeter = cv2.arcLength(contour, True)
-    if perimeter == 0:
-        circularity = 0
-    else:
-        circularity = (4 * np.pi * area) / (perimeter ** 2)
-    return {"area": area, "circularity": circularity}
-
-def process_and_count(img_gray, roi_coords, params):
+def process_with_template_matching(img_gray, roi_coords, params):
     try:
         # --- A. 预处理 ---
         if img_gray.dtype != np.uint8:
             img_gray = img_gray.astype(np.uint8)
 
-        # 这里的 clipLimit 由用户滑块控制
-        clahe = cv2.createCLAHE(clipLimit=params['clahe_clip'], tileGridSize=(8, 8))
-        enhanced = clahe.apply(img_gray)
-        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-
-        # --- B. 图像分割 ---
-        # Otsu 二值化
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 简单的 CLAHE 增强，和之前保持一致
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img_enhanced = clahe.apply(img_gray)
         
-        # 形态学去噪 (确保核大小为奇数)
-        k_size = int(params['open_kernel'])
-        if k_size % 2 == 0: k_size += 1 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-
-        # --- C. 分水岭 (分离粘连) ---
-        sure_bg = cv2.dilate(opening, kernel, iterations=3)
-        dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-        
-        # 防止全黑崩溃
-        dist_max = dist_transform.max()
-        if dist_max == 0:
-            return None, None, "图像预处理失败（全黑），请降低去噪强度或调整对比度。"
-
-        _, sure_fg = cv2.threshold(dist_transform, params['dist_ratio'] * dist_max, 255, 0)
-        sure_fg = np.uint8(sure_fg)
-        
-        unknown = cv2.subtract(sure_bg, sure_fg)
-        _, markers = cv2.connectedComponents(sure_fg)
-        markers = markers + 1
-        markers[unknown == 255] = 0
-        
-        img_color = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-        markers = cv2.watershed(img_color, markers)
-
-        # --- D. 提取模板特征 ---
+        # --- B. 提取模板 ---
+        # Canvas 坐标
         rx, ry, rw, rh = roi_coords['left'], roi_coords['top'], roi_coords['width'], roi_coords['height']
         
-        # 提取 ROI
-        roi_region_bin = opening[ry:ry+rh, rx:rx+rw]
-        roi_cnts, _ = cv2.findContours(roi_region_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not roi_cnts:
-             # 备用方案：原图 Otsu
-            roi_raw = img_gray[ry:ry+rh, rx:rx+rw]
-            _, roi_backup_thresh = cv2.threshold(roi_raw, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-            roi_cnts, _ = cv2.findContours(roi_backup_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if not roi_cnts:
-            return None, None, "框选区域内没有检测到明显的 Bud，请重画。"
-
-        template_cnt = max(roi_cnts, key=cv2.contourArea)
-        tmpl_feats = get_contour_features(template_cnt)
-
-        # --- E. 匹配筛选 ---
-        final_buds = []
-        unique_markers = np.unique(markers)
-        for label in unique_markers:
-            if label <= 1: continue 
-            mask = np.zeros(img_gray.shape, dtype=np.uint8)
-            mask[markers == label] = 255
-            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not cnts: continue
-            c = max(cnts, key=cv2.contourArea)
-            feats = get_contour_features(c)
+        # 边界检查
+        h, w = img_enhanced.shape
+        if rw <= 0 or rh <= 0 or rx >= w or ry >= h:
+            return None, None, "框选区域无效。"
             
-            # 筛选逻辑
-            area_ratio = abs(feats['area'] - tmpl_feats['area']) / (tmpl_feats['area'] + 1e-5)
-            if area_ratio > params['area_tol']: continue 
-            if feats['circularity'] < params['circ_thresh']: continue 
-            final_buds.append(c)
-
-        # --- F. 绘图 ---
-        res_img = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-        # 画轮廓
-        cv2.drawContours(res_img, final_buds, -1, (0, 0, 255), 2)
-        # 画 ROI
-        cv2.rectangle(res_img, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
-        # 画质心
-        for c in final_buds:
-            M = cv2.moments(c)
-            if M["m00"] != 0:
-                cv2.circle(res_img, (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])), 3, (0, 255, 255), -1)
+        # 裁剪模板
+        template = img_enhanced[ry:ry+rh, rx:rx+rw]
         
-        return final_buds, res_img, tmpl_feats
+        if template.shape[0] == 0 or template.shape[1] == 0:
+            return None, None, "模板为空。"
+
+        # --- C. 核心：matchTemplate (像素级匹配) ---
+        # 使用归一化相关系数匹配法 (TM_CCOEFF_NORMED)
+        # 这是最稳健的方法，结果在 0~1 之间
+        res = cv2.matchTemplate(img_enhanced, template, cv2.TM_CCOEFF_NORMED)
+        
+        # --- D. 筛选与去重 (NMS) ---
+        # 获取滑块设定的阈值
+        threshold = params['match_thresh']
+        
+        # 找到所有大于阈值的点
+        loc = np.where(res >= threshold)
+        
+        # 转换成矩形框列表 [x, y, w, h]
+        boxes = []
+        for pt in zip(*loc[::-1]):
+            boxes.append([int(pt[0]), int(pt[1]), rw, rh])
+            
+        # 使用 OpenCV 的 groupRectangles 进行去重 (Non-Maximum Suppression)
+        # groupThreshold=1 表示至少要有1次重叠才算有效（去噪）
+        # eps=0.3 表示允许重叠的程度
+        rects, weights = cv2.groupRectangles(boxes, groupThreshold=1, eps=0.3)
+        
+        # --- E. 绘图 ---
+        res_img = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+        
+        final_buds = []
+        
+        # 为了避免把自己画的那个框也算进去重复计数，我们需要计算距离
+        user_center = (rx + rw//2, ry + rh//2)
+        
+        for (x, y, w_box, h_box) in rects:
+            # 计算当前框的中心
+            curr_center = (x + w_box//2, y + h_box//2)
+            dist = np.sqrt((user_center[0]-curr_center[0])**2 + (user_center[1]-curr_center[1])**2)
+            
+            # 如果距离太近（比如小于模板宽度的一半），说明是用户自己画的那个，跳过
+            if dist < rw / 2:
+                continue
+                
+            final_buds.append([x, y, w_box, h_box])
+            # 画红框
+            cv2.rectangle(res_img, (x, y), (x + w_box, y + h_box), (0, 0, 255), 2)
+
+        # 画用户选的绿框
+        cv2.rectangle(res_img, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
+        
+        return final_buds, res_img, f"阈值: {threshold}"
 
     except Exception as e:
-        return None, None, f"算法内部错误: {str(e)}"
+        return None, None, f"算法错误: {str(e)}"
 
 # ==========================================
 # 2. UI 布局
 # ==========================================
-st.sidebar.header("🎛️ 算法微调")
-st.sidebar.markdown("如果识别不准，请尝试调整以下参数：")
+st.sidebar.header("🎛️ 匹配参数")
+st.sidebar.info("现在的算法逻辑是：'长得像的就圈出来'，不再受形状限制。")
 
 params = {
-    'clahe_clip': st.sidebar.slider("对比度增强 (CLAHE)", 1.0, 5.0, 2.0, help="值越大，图像对比度越高"),
-    'open_kernel': st.sidebar.slider("去噪强度", 1, 9, 3, help="值越大，噪点越少，但可能丢失小目标"),
-    'dist_ratio': st.sidebar.slider("粘连分离灵敏度", 0.1, 0.9, 0.5, help="越小分得越细"),
-    'area_tol': st.sidebar.slider("面积容差 (±%)", 0.1, 1.5, 0.5, help="允许目标大小与模板的差异程度"),
-    'circ_thresh': st.sidebar.slider("最小圆度限制", 0.1, 1.0, 0.6, help="值越大，要求目标越圆")
+    # 这是最重要的参数
+    'match_thresh': st.sidebar.slider("相似度阈值 (Threshold)", 0.3, 0.95, 0.60, 0.01, 
+                                    help="值越低，找出来的越多（但也可能找错）；值越高，越严格。")
 }
 
-st.title("🔬 Pro 级细胞 Bud 计数系统")
+st.title("🔬 Bud 计数器 (模板匹配版)")
+st.caption("复刻 'Image 2' 的算法逻辑：基于纹理的像素匹配。")
 
-uploaded_file = st.file_uploader("1. 上传显微图像", type=["jpg", "png", "tif"])
+uploaded_file = st.file_uploader("1. 上传图像", type=["jpg", "png", "tif"])
 
 if uploaded_file:
     pil_img = Image.open(uploaded_file).convert("RGB")
@@ -147,53 +117,46 @@ if uploaded_file:
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        st.subheader("2. 框选 ROI 模板")
-        st.caption("请在下方图片中，用鼠标画一个 **矩形** 框住一个标准的 Bud。")
+        st.subheader("2. 框选模板")
+        st.caption("请画一个框，框住一个标准的 Bud。")
         
-        # Streamlit Canvas 组件
-        # 注意：这里的 height 和 width 最好根据图片比例动态调整，这里为了简单设为固定
+        # 使用 Canvas (必须保留，用于稳定交互)
         canvas_result = st_canvas(
-            fill_color="rgba(0, 255, 0, 0.2)",  # 填充色 (半透明绿)
-            stroke_color="#00FF00",             # 边框色 (绿)
-            background_image=pil_img,           # 背景图
+            fill_color="rgba(0, 255, 0, 0.2)",
+            stroke_color="#00FF00",
+            background_image=pil_img,
             update_streamlit=True,
-            height=500,                         # 画布高度
-            drawing_mode="rect",                # 只允许画矩形
-            key="canvas",
+            height=500, 
+            drawing_mode="rect",
+            key="canvas_tm", # 改个key防止缓存
         )
 
     with col2:
-        st.subheader("3. 实时分析结果")
+        st.subheader("3. 结果")
         
-        # 检查是否画了框
         if canvas_result.json_data and len(canvas_result.json_data["objects"]) > 0:
-            # 获取最后一个画的对象
             obj = canvas_result.json_data["objects"][-1]
             roi_coords = {
-                'left': int(obj['left']), 
-                'top': int(obj['top']),
-                'width': int(obj['width']), 
-                'height': int(obj['height'])
+                'left': int(obj['left']), 'top': int(obj['top']),
+                'width': int(obj['width']), 'height': int(obj['height'])
             }
             
-            # 只有当框的大小有效时才计算
-            if roi_coords['width'] > 0 and roi_coords['height'] > 0:
-                with st.spinner("正在匹配相似目标..."):
-                    buds, res_img, info = process_and_count(img_gray, roi_coords, params)
+            if roi_coords['width'] > 0:
+                with st.spinner("正在进行全图扫描匹配..."):
+                    # 调用新的模板匹配算法
+                    buds, res_img, msg = process_with_template_matching(img_gray, roi_coords, params)
 
                 if buds is not None:
-                    st.metric("✅ 计数结果", f"{len(buds)} 个")
+                    # 总数 = 找到的相似 + 用户选的1个
+                    total = len(buds) + 1
+                    st.metric("✅ 总计数 (包含模板)", f"{total} 个")
                     
-                    # 使用 Plotly 展示大图，方便缩放查看细节
                     fig = px.imshow(res_img)
                     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=400)
                     st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.info(f"模板数据: 面积 {int(info['area'])} | 圆度 {info['circularity']:.2f}")
                 else:
-                    st.error(f"⚠️ {info}")
+                    st.error(msg)
         else:
-            st.info("👈 等待框选...")
-
+            st.info("👈 请先画框。")
 else:
-    st.info("👋 请先上传一张图片。")
+    st.info("👋 请先上传图片。")
