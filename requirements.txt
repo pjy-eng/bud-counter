@@ -1,6 +1,6 @@
-streamlit
+streamlit>=1.40.0
 opencv-python-headless
 numpy
 plotly
 pillow
-streamlit-drawable-canvas
+streamlit-drawable-canvas==0.9.5
