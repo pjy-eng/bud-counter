@@ -2,190 +2,154 @@ import cv2
 import numpy as np
 from PIL import Image
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+import plotly.express as px
+import plotly.graph_objects as go
 
 # =========================
-# 工具函数
+# 图像处理核心（分水岭）
 # =========================
 
-def calculate_circularity(area, perimeter):
-    if perimeter == 0:
-        return 0
-    return (4 * np.pi * area) / (perimeter ** 2)
+def watershed_bud_segmentation(img_gray):
+    # 去噪
+    denoise = cv2.fastNlMeansDenoising(img_gray, None, h=10)
 
+    # 对比度增强
+    clahe = cv2.createCLAHE(2.0, (8, 8))
+    enh = clahe.apply(denoise)
 
-def process_image(pil_image, roi):
-    img_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # Otsu 二值化
+    _, bw = cv2.threshold(enh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    img_enhanced = clahe.apply(img_gray)
-    img_blur = cv2.GaussianBlur(img_enhanced, (5, 5), 0)
-
-    rx, ry, rw, rh = int(roi["x"]), int(roi["y"]), int(roi["w"]), int(roi["h"])
-
-    if rw <= 5 or rh <= 5:
-        return img_bgr, 0, "ROI 太小"
-
-    H, W = img_blur.shape
-    rx = max(0, min(rx, W - 1))
-    ry = max(0, min(ry, H - 1))
-    rw = max(1, min(rw, W - rx))
-    rh = max(1, min(rh, H - ry))
-
-    roi_region = img_blur[ry:ry + rh, rx:rx + rw]
-
-    _, roi_thresh = cv2.threshold(
-        roi_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    contours, _ = cv2.findContours(
-        roi_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        return img_bgr, 0, "ROI 中未检测到目标"
-
-    template_cnt = max(contours, key=cv2.contourArea)
-
-    tmpl_area = cv2.contourArea(template_cnt)
-    tmpl_perimeter = cv2.arcLength(template_cnt, True)
-    tmpl_circ = calculate_circularity(tmpl_area, tmpl_perimeter)
-    tmpl_mean = cv2.mean(roi_region, mask=roi_thresh)[0]
-
-    thresh_global = cv2.adaptiveThreshold(
-        img_blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 25, 2
-    )
-
+    # 形态学去噪
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    thresh_global = cv2.morphologyEx(
-        thresh_global, cv2.MORPH_OPEN, kernel, iterations=2
-    )
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    all_contours, _ = cv2.findContours(
-        thresh_global, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    # 距离变换
+    dist = cv2.distanceTransform(bw, cv2.DIST_L2, 5)
+    dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
 
-    matched = []
+    # 前景种子
+    _, sure_fg = cv2.threshold(dist_norm, 0.4, 1.0, cv2.THRESH_BINARY)
+    sure_fg = np.uint8(sure_fg * 255)
 
-    area_tol = 0.45
-    circ_tol = 0.30
-    gray_tol = 0.35
+    # 背景
+    sure_bg = cv2.dilate(bw, kernel, iterations=3)
 
-    for cnt in all_contours:
-        area = cv2.contourArea(cnt)
-        if area < 8:
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    # 连通域标记
+    _, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+
+    img_color = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+    markers = cv2.watershed(img_color, markers)
+
+    # 提取每个 bud 的轮廓
+    buds = []
+    for label in np.unique(markers):
+        if label <= 1:
             continue
+        mask = np.uint8(markers == label)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            c = max(cnts, key=cv2.contourArea)
+            if cv2.contourArea(c) > 30:
+                buds.append(c)
 
-        per = cv2.arcLength(cnt, True)
-        circ = calculate_circularity(area, per)
+    return buds
 
-        if not (tmpl_area * (1 - area_tol) < area < tmpl_area * (1 + area_tol)):
-            continue
 
-        if circ < tmpl_circ * (1 - circ_tol):
-            continue
+# =========================
+# 将 Plotly ROI 转换回像素
+# =========================
 
-        mask = np.zeros_like(img_gray)
-        cv2.drawContours(mask, [cnt], -1, 255, -1)
-        mean_val = cv2.mean(img_gray, mask=mask)[0]
-
-        if not (tmpl_mean * (1 - gray_tol) < mean_val < tmpl_mean * (1 + gray_tol)):
-            continue
-
-        matched.append(cnt)
-
-    result_img = img_bgr.copy()
-    cv2.drawContours(result_img, matched, -1, (0, 0, 255), 2)
-    cv2.rectangle(result_img, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
-
-    count = len(matched)
-    cv2.putText(
-        result_img, f"Count: {count}",
-        (30, 50),
-        cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3
-    )
-
-    msg = f"模板面积={tmpl_area:.1f}, 圆度={tmpl_circ:.3f}, 灰度={tmpl_mean:.1f}"
-    return result_img, count, msg
+def parse_plotly_roi(relayout_data, img_w, img_h):
+    try:
+        x0 = int(relayout_data["shapes[0].x0"])
+        y0 = int(relayout_data["shapes[0].y0"])
+        x1 = int(relayout_data["shapes[0].x1"])
+        y1 = int(relayout_data["shapes[0].y1"])
+        return {
+            "x": min(x0, x1),
+            "y": min(y0, y1),
+            "w": abs(x1 - x0),
+            "h": abs(y1 - y0),
+        }
+    except:
+        return None
 
 
 # =========================
 # Streamlit 页面
 # =========================
 
-st.set_page_config(page_title="Bud Counter", layout="wide")
-st.title("🔬 细胞芽（Bud）在线计数 · 兼容版")
+st.set_page_config(layout="wide")
+st.title("🔬 Bud 在线计数（Plotly 交互 + 分水岭）")
 
-uploaded_file = st.file_uploader(
-    "📁 上传显微图像", type=["png", "jpg", "jpeg", "tif", "tiff"]
-)
+uploaded_file = st.file_uploader("📁 上传显微图像", type=["png", "jpg", "jpeg", "tif", "tiff"])
 
 if uploaded_file is None:
-    st.info("请先上传一张显微图像。")
+    st.info("请先上传一张图像")
     st.stop()
 
 pil_image = Image.open(uploaded_file).convert("RGB")
 img_w, img_h = pil_image.size
+img_gray = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2GRAY)
 
-st.subheader("① 原始图像（仅用于参考）")
-st.image(pil_image, use_column_width=True)
+# =========================
+# Plotly 交互 ROI
+# =========================
 
-st.subheader("② ROI 框选（与原图完全等比例映射）")
-st.write("请在下方白色画布中 **按照原图位置比例** 框选一个芽")
+st.subheader("① 在原图上直接框选一个 Bud 作为模板")
 
-display_w = 600
-scale = display_w / img_w
-display_h = int(img_h * scale)
-
-canvas_result = st_canvas(
-    fill_color="rgba(0, 255, 0, 0.2)",
-    stroke_width=2,
-    stroke_color="#00FF00",
-    background_color="white",
-    update_streamlit=True,
-    height=display_h,
-    width=display_w,
-    drawing_mode="rect",
-    key="canvas",
+fig = px.imshow(pil_image)
+fig.update_layout(
+    dragmode="drawrect",
+    newshape=dict(line_color="lime"),
+    margin=dict(l=0, r=0, t=0, b=0)
 )
 
+plotly_event = st.plotly_chart(fig, use_container_width=True)
+
 roi = None
-if canvas_result.json_data is not None:
-    objects = canvas_result.json_data.get("objects", [])
-    if objects:
-        for obj in objects[::-1]:
-            if obj.get("type") == "rect":
-                roi = {
-                    "x": int(obj.get("left") / scale),
-                    "y": int(obj.get("top") / scale),
-                    "w": int(obj.get("width") / scale),
-                    "h": int(obj.get("height") / scale),
-                }
-                break
+if plotly_event and hasattr(plotly_event, "relayout_data"):
+    roi = parse_plotly_roi(plotly_event.relayout_data, img_w, img_h)
 
 if roi:
-    st.success(f"映射 ROI(px)：x={roi['x']}, y={roi['y']}, w={roi['w']}, h={roi['h']}")
+    st.success(f"ROI: x={roi['x']}, y={roi['y']}, w={roi['w']}, h={roi['h']}")
 else:
-    st.warning("请在画布中框选一个芽作为模板")
+    st.warning("请在图像上直接画一个矩形")
+
+# =========================
+# 分水岭识别
+# =========================
 
 if st.button("🚀 开始识别并计数"):
-    if roi is None:
-        st.error("未检测到 ROI")
-    else:
-        with st.spinner("正在计算..."):
-            result_bgr, count, debug = process_image(pil_image, roi)
+    with st.spinner("正在进行分水岭分割与计数..."):
 
-        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+        buds = watershed_bud_segmentation(img_gray)
 
-        st.subheader("③ 识别结果")
+        result = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+        for c in buds:
+            cv2.drawContours(result, [c], -1, (0, 0, 255), 2)
+
+        # ROI 标注
+        if roi:
+            cv2.rectangle(
+                result,
+                (roi["x"], roi["y"]),
+                (roi["x"] + roi["w"], roi["y"] + roi["h"]),
+                (0, 255, 0),
+                2,
+            )
+
+        count = len(buds)
+
+        st.subheader("② 分水岭识别结果")
         st.image(
-            [pil_image, result_rgb],
-            caption=["原图", f"检测结果（Count={count}）"],
+            [pil_image, result[:, :, ::-1]],
+            caption=["原图", f"识别结果（Count={count}）"],
             use_column_width=True,
         )
-
-        st.success(f"✅ 检测到 {count} 个芽")
-        st.caption("Debug：" + debug)
+        st.success(f"✅ 当前检测到 {count} 个 bud")
