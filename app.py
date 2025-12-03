@@ -8,86 +8,122 @@ from streamlit_drawable_canvas import st_canvas
 # ==========================================
 # 0. 全局配置
 # ==========================================
-st.set_page_config(page_title="Bud Counter (Template Match)", layout="wide")
+st.set_page_config(page_title="High-Accuracy Bud Counter", layout="wide")
 
 if 'roi_coords' not in st.session_state:
     st.session_state['roi_coords'] = None
 
 # ==========================================
-# 1. 核心算法：模板匹配 (复现第二张图的逻辑)
+# 1. 核心算法：多尺度 + 多角度 模板匹配
 # ==========================================
-def process_with_template_matching(img_gray, roi_coords, params):
+def rotate_image(image, angle):
+    """辅助函数：旋转图像"""
+    image_center = tuple(np.array(image.shape[1::-1]) / 2)
+    rot_mat = cv2.getRotationMatrix2D(image_center, angle, 1.0)
+    result = cv2.warpAffine(image, rot_mat, image.shape[1::-1], flags=cv2.INTER_LINEAR)
+    return result
+
+def process_multiscale_matching(img_gray, roi_coords, params):
     try:
         # --- A. 预处理 ---
         if img_gray.dtype != np.uint8:
             img_gray = img_gray.astype(np.uint8)
 
-        # 简单的 CLAHE 增强，和之前保持一致
+        # 对比度增强 (CLAHE)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         img_enhanced = clahe.apply(img_gray)
         
-        # --- B. 提取模板 ---
-        # Canvas 坐标
+        # --- B. 准备模板 ---
         rx, ry, rw, rh = roi_coords['left'], roi_coords['top'], roi_coords['width'], roi_coords['height']
+        h, w = img_enhanced.shape
         
         # 边界检查
-        h, w = img_enhanced.shape
-        if rw <= 0 or rh <= 0 or rx >= w or ry >= h:
-            return None, None, "框选区域无效。"
+        if rw <= 5 or rh <= 5 or rx >= w or ry >= h:
+            return None, None, "框选区域无效或太小。"
             
-        # 裁剪模板
-        template = img_enhanced[ry:ry+rh, rx:rx+rw]
+        base_template = img_enhanced[ry:ry+rh, rx:rx+rw]
         
-        if template.shape[0] == 0 or template.shape[1] == 0:
-            return None, None, "模板为空。"
-
-        # --- C. 核心：matchTemplate (像素级匹配) ---
-        # 使用归一化相关系数匹配法 (TM_CCOEFF_NORMED)
-        # 这是最稳健的方法，结果在 0~1 之间
-        res = cv2.matchTemplate(img_enhanced, template, cv2.TM_CCOEFF_NORMED)
+        # --- C. 多尺度 + 多角度搜索 ---
+        all_detections = [] # 存储格式: [x, y, w, h, score]
         
-        # --- D. 筛选与去重 (NMS) ---
-        # 获取滑块设定的阈值
+        # 1. 定义搜索范围
+        # 尺度：从 0.8 倍到 1.2 倍，分 5 档
+        scales = np.linspace(0.8, 1.2, 5) 
+        # 角度：0, 90, 180, 270 (如果需要更精细可以加 45, 135...)
+        angles = [0, 90, 180, 270] if params['use_rotation'] else [0]
+        
         threshold = params['match_thresh']
-        
-        # 找到所有大于阈值的点
-        loc = np.where(res >= threshold)
-        
-        # 转换成矩形框列表 [x, y, w, h]
-        boxes = []
-        for pt in zip(*loc[::-1]):
-            boxes.append([int(pt[0]), int(pt[1]), rw, rh])
+
+        # 2. 循环匹配 (暴力搜索)
+        for scale in scales:
+            # 缩放模板
+            t_w = int(base_template.shape[1] * scale)
+            t_h = int(base_template.shape[0] * scale)
             
-        # 使用 OpenCV 的 groupRectangles 进行去重 (Non-Maximum Suppression)
-        # groupThreshold=1 表示至少要有1次重叠才算有效（去噪）
-        # eps=0.3 表示允许重叠的程度
-        rects, weights = cv2.groupRectangles(boxes, groupThreshold=1, eps=0.3)
+            if t_w <= 0 or t_h <= 0 or t_w > w or t_h > h: continue
+            
+            scaled_template_base = cv2.resize(base_template, (t_w, t_h))
+            
+            for angle in angles:
+                # 旋转模板
+                if angle == 0:
+                    curr_template = scaled_template_base
+                else:
+                    curr_template = rotate_image(scaled_template_base, angle)
+
+                # 匹配
+                res = cv2.matchTemplate(img_enhanced, curr_template, cv2.TM_CCOEFF_NORMED)
+                
+                # 筛选
+                loc = np.where(res >= threshold)
+                for pt in zip(*loc[::-1]):
+                    # 记录结果：x, y, w, h, score
+                    score = res[pt[1], pt[0]]
+                    all_detections.append([int(pt[0]), int(pt[1]), t_w, t_h, score])
+
+        # --- D. NMS (非极大值抑制) 去重 ---
+        if not all_detections:
+            return [], cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR), "未找到匹配目标，请降低阈值。"
+
+        # 将 list 转为 numpy array 以便处理
+        detections = np.array(all_detections)
         
-        # --- E. 绘图 ---
+        # OpenCV 的 groupRectangles 需要 [x, y, w, h] 格式
+        # 但我们需要保留 score 来做更高级的筛选，这里手写一个简单的基于 score 的 NMS
+        # 或者为了简单稳定，使用 OpenCV 的 groupRectangles (不考虑 score，只考虑位置)
+        
+        # 转换格式适配 cv2.groupRectangles
+        rects_for_cv = []
+        for det in detections:
+            rects_for_cv.append([int(det[0]), int(det[1]), int(det[2]), int(det[3])])
+        
+        # groupThreshold=1: 至少重叠 1 次 (去噪)
+        # eps=0.2: 重叠阈值
+        nms_rects, weights = cv2.groupRectangles(rects_for_cv, groupThreshold=1, eps=0.2)
+        
+        # --- E. 绘图与排除自身 ---
         res_img = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-        
         final_buds = []
         
-        # 为了避免把自己画的那个框也算进去重复计数，我们需要计算距离
         user_center = (rx + rw//2, ry + rh//2)
         
-        for (x, y, w_box, h_box) in rects:
-            # 计算当前框的中心
+        for (x, y, w_box, h_box) in nms_rects:
+            # 计算中心距离，排除用户自己画的那个框
             curr_center = (x + w_box//2, y + h_box//2)
             dist = np.sqrt((user_center[0]-curr_center[0])**2 + (user_center[1]-curr_center[1])**2)
             
-            # 如果距离太近（比如小于模板宽度的一半），说明是用户自己画的那个，跳过
-            if dist < rw / 2:
+            if dist < rw / 2: # 如果非常接近原点，跳过
                 continue
                 
             final_buds.append([x, y, w_box, h_box])
-            # 画红框
+            
+            # 画红框 (显示找到的目标)
             cv2.rectangle(res_img, (x, y), (x + w_box, y + h_box), (0, 0, 255), 2)
 
-        # 画用户选的绿框
+        # 画绿框 (用户模板)
         cv2.rectangle(res_img, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
         
-        return final_buds, res_img, f"阈值: {threshold}"
+        return final_buds, res_img, f"搜索完成"
 
     except Exception as e:
         return None, None, f"算法错误: {str(e)}"
@@ -95,17 +131,15 @@ def process_with_template_matching(img_gray, roi_coords, params):
 # ==========================================
 # 2. UI 布局
 # ==========================================
-st.sidebar.header("🎛️ 匹配参数")
-st.sidebar.info("现在的算法逻辑是：'长得像的就圈出来'，不再受形状限制。")
+st.sidebar.header("🎛️ 高级设置")
 
 params = {
-    # 这是最重要的参数
-    'match_thresh': st.sidebar.slider("相似度阈值 (Threshold)", 0.3, 0.95, 0.60, 0.01, 
-                                    help="值越低，找出来的越多（但也可能找错）；值越高，越严格。")
+    'match_thresh': st.sidebar.slider("相似度阈值", 0.3, 0.95, 0.60, 0.01, help="越低越容易找到（可能误报），越高越精准"),
+    'use_rotation': st.sidebar.checkbox("启用旋转搜索 (更准但更慢)", value=False, help="勾选后会尝试不同角度匹配，耗时增加 4 倍")
 }
 
-st.title("🔬 Bud 计数器 (模板匹配版)")
-st.caption("复刻 'Image 2' 的算法逻辑：基于纹理的像素匹配。")
+st.title("🔬 高精度细胞计数 (多尺度版)")
+st.markdown("此版本会自动搜索 **大小不同 (±20%)** 的目标。勾选左侧 **旋转搜索** 可进一步提高准确率。")
 
 uploaded_file = st.file_uploader("1. 上传图像", type=["jpg", "png", "tif"])
 
@@ -117,22 +151,20 @@ if uploaded_file:
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        st.subheader("2. 框选模板")
-        st.caption("请画一个框，框住一个标准的 Bud。")
-        
-        # 使用 Canvas (必须保留，用于稳定交互)
+        st.subheader("2. 定义模板")
+        st.caption("框选一个清晰的 Bud 作为基准。")
         canvas_result = st_canvas(
             fill_color="rgba(0, 255, 0, 0.2)",
             stroke_color="#00FF00",
             background_image=pil_img,
             update_streamlit=True,
-            height=500, 
+            height=500,
             drawing_mode="rect",
-            key="canvas_tm", # 改个key防止缓存
+            key="canvas_multi",
         )
 
     with col2:
-        st.subheader("3. 结果")
+        st.subheader("3. 智能分析")
         
         if canvas_result.json_data and len(canvas_result.json_data["objects"]) > 0:
             obj = canvas_result.json_data["objects"][-1]
@@ -142,21 +174,22 @@ if uploaded_file:
             }
             
             if roi_coords['width'] > 0:
-                with st.spinner("正在进行全图扫描匹配..."):
-                    # 调用新的模板匹配算法
-                    buds, res_img, msg = process_with_template_matching(img_gray, roi_coords, params)
+                with st.spinner("正在进行多尺度全图扫描..."):
+                    buds, res_img, msg = process_multiscale_matching(img_gray, roi_coords, params)
 
                 if buds is not None:
-                    # 总数 = 找到的相似 + 用户选的1个
-                    total = len(buds) + 1
-                    st.metric("✅ 总计数 (包含模板)", f"{total} 个")
+                    count = len(buds) + 1
+                    st.metric("✅ 最终计数", f"{count} 个")
                     
                     fig = px.imshow(res_img)
                     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=400)
                     st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.success(f"已自动匹配 0.8x ~ 1.2x 大小的目标")
                 else:
-                    st.error(msg)
+                    st.warning(msg)
         else:
             st.info("👈 请先画框。")
+
 else:
-    st.info("👋 请先上传图片。")
+    st.info("请上传图片。")
