@@ -5,78 +5,101 @@ import torch
 import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
+import os
+import urllib.request
 
-# -------------------------------
-# Streamlit 页面配置
-# -------------------------------
+# =========================
+# 页面配置
+# =========================
 st.set_page_config(layout="wide")
-st.title("🔬 Bud 自动识别系统（ResNet 模型版）")
+st.title("🔬 Bud 自动识别系统（ResNet18 · 96×96 · 云端版）")
 
-# -------------------------------
-# 1. 加载你的 ResNet 模型
-# -------------------------------
+# =========================
+# 模型下载配置（★你只需要改这里的 URL）
+# =========================
+MODEL_URL = "https://你的直链/ResNet18_window96_v2.pth"   # ← 替换成你的真实直链
+MODEL_PATH = "model.pth"
+
+# =========================
+# 加载模型（自动下载）
+# =========================
 @st.cache_resource
 def load_model():
+    if not os.path.exists(MODEL_PATH):
+        with st.spinner("📥 首次运行，正在自动下载模型权重..."):
+            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     model = models.resnet18(pretrained=False)
-    model.fc = nn.Linear(model.fc.in_features, 2)
-    model.load_state_dict(torch.load("model.pth", map_location=device))
+    model.fc = nn.Linear(model.fc.in_features, 2)  # Bud vs 非Bud
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+
     model.to(device)
     model.eval()
     return model, device
 
 model, device = load_model()
 
+# =========================
+# 96×96 预处理（与你训练完全一致）
+# =========================
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((96, 96)),
     transforms.ToTensor(),
 ])
 
-# -------------------------------
-# 2. 滑窗候选生成
-# -------------------------------
-def generate_patches(img_gray, step=64, win=128):
+# =========================
+# 滑窗候选生成
+# =========================
+def generate_patches(img_gray, step=48, win=96):
     patches = []
     coords = []
     h, w = img_gray.shape
+
     for y in range(0, h - win, step):
         for x in range(0, w - win, step):
             crop = img_gray[y:y+win, x:x+win]
             patches.append(crop)
             coords.append((x, y))
+
     return patches, coords
 
-# -------------------------------
-# 3. ResNet 判断 Bud
-# -------------------------------
+# =========================
+# ResNet 分类
+# =========================
 @torch.no_grad()
 def classify_patches(patches):
-    preds = []
+    probs = []
+
     for p in patches:
         pil = Image.fromarray(p).convert("L").convert("RGB")
         t = transform(pil).unsqueeze(0).to(device)
         out = model(t)
         prob = torch.softmax(out, 1)[0, 1].item()  # Bud 概率
-        preds.append(prob)
-    return preds
+        probs.append(prob)
 
-# -------------------------------
-# 4. NMS 合并重复检测
-# -------------------------------
+    return probs
+
+# =========================
+# NMS 合并重复框
+# =========================
 def nms(boxes, scores, threshold=0.3):
     if len(boxes) == 0:
         return []
+
     boxes = np.array(boxes)
     scores = np.array(scores)
 
-    x1 = boxes[:,0]
-    y1 = boxes[:,1]
-    x2 = boxes[:,0] + boxes[:,2]
-    y2 = boxes[:,1] + boxes[:,3]
-    areas = boxes[:,2] * boxes[:,3]
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 0] + boxes[:, 2]
+    y2 = boxes[:, 1] + boxes[:, 3]
+    areas = boxes[:, 2] * boxes[:, 3]
 
     order = scores.argsort()[::-1]
     keep = []
+
     while order.size > 0:
         i = order[0]
         keep.append(i)
@@ -89,16 +112,17 @@ def nms(boxes, scores, threshold=0.3):
         w = np.maximum(0, xx2 - xx1)
         h = np.maximum(0, yy2 - yy1)
         inter = w * h
-        iou = inter / (areas[i] + areas[order[1:]] - inter)
 
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
         inds = np.where(iou < threshold)[0]
         order = order[inds + 1]
+
     return keep
 
-# -------------------------------
-# 5. Streamlit 主界面
-# -------------------------------
-uploaded = st.file_uploader("上传 TEM 图像", type=["png", "jpg", "tif"])
+# =========================
+# Streamlit 主界面
+# =========================
+uploaded = st.file_uploader("📂 上传 TEM 图像", type=["png", "jpg", "tif"])
 
 if uploaded:
     img = Image.open(uploaded).convert("RGB")
@@ -106,27 +130,34 @@ if uploaded:
     img_gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
     col1, col2 = st.columns(2)
-    col1.image(img_np, caption="原图", use_container_width=True)
+    col1.image(img_np, caption="原始图像", use_container_width=True)
 
-    if st.button("🚀 开始自动识别"):
-        with st.spinner("正在进行滑窗 + ResNet 预测..."):
+    if st.button("🚀 开始自动识别 Bud"):
+        with st.spinner("正在进行滑窗检测 + ResNet 推理..."):
+
             patches, coords = generate_patches(img_gray)
             probs = classify_patches(patches)
 
             boxes = []
             scores = []
+
             for (x, y), p in zip(coords, probs):
-                if p > 0.9:  # 置信度阈值
-                    boxes.append((x, y, 128, 128))
+                if p > 0.85:    # ★你可以后续微调这个阈值
+                    boxes.append((x, y, 96, 96))
                     scores.append(p)
 
-            keep = nms(boxes, scores)
+            keep = nms(boxes, scores, threshold=0.25)
 
             result_img = img_np.copy()
             for i in keep:
                 x, y, w, h = boxes[i]
-                cv2.rectangle(result_img, (x, y), (x+w, y+h), (0,255,0), 2)
+                cv2.rectangle(result_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
-            col2.image(result_img, caption=f"识别结果 Count={len(keep)}", use_container_width=True)
-            st.success(f"✅ 识别 Bud 数量：{len(keep)}")
+            col2.image(result_img,
+                       caption=f"识别结果（Count = {len(keep)}）",
+                       use_container_width=True)
 
+            st.success(f"✅ 当前识别到 Bud 数量：{len(keep)}")
+
+else:
+    st.info("请先上传一张 TEM 图像。")
