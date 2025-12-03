@@ -28,36 +28,40 @@ import requests
 
 @st.cache_resource
 def load_model():
-    if not os.path.exists(MODEL_PATH):
-        with st.spinner("📥 首次运行，正在安全下载模型权重（Google Drive 大文件模式）..."):
-            session = requests.Session()
-            response = session.get(MODEL_URL, stream=True)
+    # ✅ 无论有没有旧文件，一律重新下载（防止HTML假文件污染）
+    if os.path.exists(MODEL_PATH):
+        os.remove(MODEL_PATH)
 
-            # ✅ 处理 Google Drive >40MB 的确认下载机制
-            for key, value in response.cookies.items():
-                if key.startswith("download_warning"):
-                    params = {"confirm": value}
-                    response = session.get(MODEL_URL, params=params, stream=True)
-                    break
+    with st.spinner("📥 正在从 Google Drive 强制重新下载模型权重..."):
+        session = requests.Session()
+        response = session.get(MODEL_URL, stream=True)
 
-            # ✅ 真正写入二进制权重文件
-            with open(MODEL_PATH, "wb") as f:
-                for chunk in response.iter_content(32768):
-                    if chunk:
-                        f.write(chunk)
+        for key, value in response.cookies.items():
+            if key.startswith("download_warning"):
+                params = {"confirm": value}
+                response = session.get(MODEL_URL, params=params, stream=True)
+                break
+
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in response.iter_content(32768):
+                if chunk:
+                    f.write(chunk)
+
+    # ✅ 下载完成后立即校验文件大小（防止再次下载到HTML）
+    file_size_mb = os.path.getsize(MODEL_PATH) / (1024 * 1024)
+    if file_size_mb < 10:
+        raise RuntimeError(f"模型下载失败，当前文件只有 {file_size_mb:.2f} MB，极可能是 HTML 文件")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model = models.resnet18(pretrained=False)
     model.fc = nn.Linear(model.fc.in_features, 2)
 
-    # ✅ 现在这里加载的一定是“真权重文件”
     state = torch.load(MODEL_PATH, map_location=device)
     model.load_state_dict(state, strict=True)
 
     model.to(device)
     model.eval()
-
     return model, device
 
 
