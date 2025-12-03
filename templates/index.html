@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>OpenCV 细胞芽交互式计数</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        h2 { color: #333; }
+        .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }
+        #canvas-wrapper { position: relative; margin-top: 20px; border: 2px solid #ddd; display: inline-block; }
+        canvas { cursor: crosshair; display: block; max-width: 100%; }
+        .controls { margin-bottom: 15px; }
+        .status { margin-top: 10px; font-weight: bold; color: #007bff; }
+        button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>🔬 显微图像 Bud 识别 (OpenCV 传统算法版)</h2>
+
+        <div class="controls">
+            <input type="file" id="uploadInput" accept="image/*">
+            <span style="color: #666; font-size: 0.9em;">(上传图片 -> 鼠标框选一个芽 -> 自动计算)</span>
+        </div>
+
+        <div id="canvas-wrapper">
+            <canvas id="imgCanvas"></canvas>
+        </div>
+
+        <div class="status" id="statusText">等待上传...</div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('imgCanvas');
+        const ctx = canvas.getContext('2d');
+        const fileInput = document.getElementById('uploadInput');
+        const statusText = document.getElementById('statusText');
+
+        let img = new Image();
+        let isDrawing = false;
+        let startX, startY;
+        let originalImageData = null; // 保存纯净的图片数据
+
+        // 1. 图片上传处理
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if(!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                img.onload = () => {
+                    // 设置 canvas 尺寸为图片原始尺寸
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    ctx.drawImage(img, 0, 0);
+                    // 保存原始 Base64 用于发送
+                    originalImageData = event.target.result;
+                    statusText.textContent = "请用鼠标在图中框选一个标准的'芽'";
+                }
+                img.src = event.target.result;
+            }
+            reader.readAsDataURL(file);
+        });
+
+        // 2. 鼠标交互 - 框选 ROI
+        canvas.addEventListener('mousedown', (e) => {
+            if(!img.src) return;
+            const rect = canvas.getBoundingClientRect();
+            // 计算缩放比例 (如果CSS缩放了Canvas)
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+
+            startX = (e.clientX - rect.left) * scaleX;
+            startY = (e.clientY - rect.top) * scaleY;
+            isDrawing = true;
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDrawing) return;
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const mouseX = (e.clientX - rect.left) * scaleX;
+            const mouseY = (e.clientY - rect.top) * scaleY;
+
+            // 实时重绘图片和选框
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0);
+
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(startX, startY, mouseX - startX, mouseY - startY);
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (!isDrawing) return;
+            isDrawing = false;
+
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const endX = (e.clientX - rect.left) * scaleX;
+            const endY = (e.clientY - rect.top) * scaleY;
+
+            const w = Math.abs(endX - startX);
+            const h = Math.abs(endY - startY);
+            const x = Math.min(startX, endX);
+            const y = Math.min(startY, endY);
+
+            if (w < 10 || h < 10) {
+                statusText.textContent = "选框太小，请重试";
+                return;
+            }
+
+            sendRoiData(x, y, w, h);
+        });
+
+        // 3. 发送数据给后端
+        function sendRoiData(x, y, w, h) {
+            statusText.textContent = "正在计算特征与匹配...";
+
+            fetch('/process', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    image: originalImageData, // 发送原始图片
+                    roi: { x, y, w, h }
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if(data.error) {
+                    statusText.textContent = "错误: " + data.error;
+                    return;
+                }
+
+                // 渲染结果
+                const resImg = new Image();
+                resImg.onload = () => {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.drawImage(resImg, 0, 0);
+                    // 更新当前的显示图片，以便下次可以基于结果图操作（如果需要）
+                    // img = resImg;
+                };
+                resImg.src = data.result_image;
+
+                statusText.textContent = `计算完成! 找到 ${data.count} 个相似目标 (面积: ${Math.round(data.debug_info.template_area)})`;
+            })
+            .catch(err => {
+                console.error(err);
+                statusText.textContent = "服务器连接失败";
+            });
+        }
+    </script>
+</body>
+</html>
